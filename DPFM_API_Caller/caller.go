@@ -4,10 +4,12 @@ import (
 	"context"
 	dpfm_api_input_reader "data-platform-api-currency-exconf-rmq-kube/DPFM_API_Input_Reader"
 	dpfm_api_output_formatter "data-platform-api-currency-exconf-rmq-kube/DPFM_API_Output_Formatter"
-	"data-platform-api-currency-exconf-rmq-kube/database"
-	"sync"
+	"encoding/json"
 
 	"github.com/latonaio/golang-logging-library-for-data-platform/logger"
+	database "github.com/latonaio/golang-mysql-network-connector"
+	rabbitmq "github.com/latonaio/rabbitmq-golang-client-for-data-platform"
+	"golang.org/x/xerrors"
 )
 
 type ExistenceConf struct {
@@ -24,61 +26,56 @@ func NewExistenceConf(ctx context.Context, db *database.Mysql, l *logger.Logger)
 	}
 }
 
-func (e *ExistenceConf) Conf(input *dpfm_api_input_reader.SDC) *dpfm_api_output_formatter.Currency {
-	currency := *input.Currency.Currency
-	notKeyExistence := make([]string, 0, 1)
-	KeyExistence := make([]string, 0, 1)
+func (e *ExistenceConf) Conf(msg rabbitmq.RabbitmqMessage) interface{} {
+	var ret interface{}
+	ret = map[string]interface{}{
+		"ExistenceConf": false,
+	}
+	input := make(map[string]interface{})
+	err := json.Unmarshal(msg.Raw(), &input)
+	if err != nil {
+		return ret
+	}
 
-	existData := &dpfm_api_output_formatter.Currency{
-		Currency:      currency,
+	_, ok := input["Currency"]
+	if ok {
+		input := &dpfm_api_input_reader.SDC{}
+		err = json.Unmarshal(msg.Raw(), input)
+		ret = e.confCurrency(input)
+		goto endProcess
+	}
+
+	err = xerrors.Errorf("can not get exconf check target")
+endProcess:
+	if err != nil {
+		e.l.Error(err)
+	}
+	return ret
+}
+
+func (e *ExistenceConf) confCurrency(input *dpfm_api_input_reader.SDC) *dpfm_api_output_formatter.Currency {
+	exconf := dpfm_api_output_formatter.Currency{
+		ExistenceConf: false,
+	}
+	if input.Currency.Currency == nil {
+		return &exconf
+	}
+	exconf = dpfm_api_output_formatter.Currency{
+		Currency:      *input.Currency.Currency,
 		ExistenceConf: false,
 	}
 
-	wg := sync.WaitGroup{}
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		if !e.confCurrency(currency) {
-			notKeyExistence = append(notKeyExistence, currency)
-			return
-		}
-		KeyExistence = append(KeyExistence, currency)
-	}()
-
-	wg.Wait()
-
-	if len(KeyExistence) == 0 {
-		return existData
-	}
-	if len(notKeyExistence) > 0 {
-		return existData
-	}
-
-	existData.ExistenceConf = true
-	return existData
-}
-
-func (e *ExistenceConf) confCurrency(val string) bool {
 	rows, err := e.db.Query(
 		`SELECT Currency 
 		FROM DataPlatformMastersAndTransactionsMysqlKube.data_platform_currency_currency_data 
-		WHERE Currency = ?;`, val,
+		WHERE Currency = ?;`, exconf.Currency,
 	)
 	if err != nil {
 		e.l.Error(err)
-		return false
+		return &exconf
 	}
+	defer rows.Close()
 
-	for rows.Next() {
-		var currency string
-		err := rows.Scan(&currency)
-		if err != nil {
-			e.l.Error(err)
-			continue
-		}
-		if currency == val {
-			return true
-		}
-	}
-	return false
+	exconf.ExistenceConf = rows.Next()
+	return &exconf
 }
